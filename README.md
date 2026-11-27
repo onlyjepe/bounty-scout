@@ -11,6 +11,8 @@ Built for **Hacksgiving 2026** (Fly.io, Nov 23–29).
 
 1. **Watch** — every hour it fetches the public HackenProof programs page
    (`hackenproof.com/programs`) and spots slugs it has not seen before.
+   It also re-fetches every program it already knows, so it catches
+   changes to existing programs too.
 2. **Research** — for each new program it fetches the program page and reads
    the reward range, per-severity rewards, reputation gate, scope
    (smart contracts / web / API / mobile), PoC requirement, published date,
@@ -20,9 +22,14 @@ Built for **Hacksgiving 2026** (Fly.io, Nov 23–29).
    - reputation gate vs the hunter's 80 rep (+20 if they can join now)
    - smart contracts in scope (+15), web (+10), API (+5)
    - already paid out rewards (+5), PoC required (-5)
+   - freshness: published in the last 30 days (+10)
 4. **File** — programs scoring 60+ become GitHub issues in this repo with a
    triage note: rewards, scope, reputation verdict, and score breakdown.
    At most 5 issues per run, so the first run does not spam the repo.
+5. **Changes** — when a known program changes, the agent files a
+   `[Change]` issue if it matters: max reward up $500+, reputation gate
+   now passable with 80 rep, or smart contracts added to scope. Smaller
+   changes (payout growth, web/API added) are logged on the status page.
 
 ## Connectors
 
