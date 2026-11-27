@@ -1,8 +1,10 @@
-// Bounty Scout — a personal agent that lives on a Fly.io Sprite.
-// Watches HackenProof for new bug bounty programs, scores them against
-// the hunter's profile, and files the good ones as GitHub issues.
-// Runs on a Sprite. Uses the GitHub connector through the Sprites API
-// Gateway (no token ever lives on the Sprite).
+// Bounty Scout v2 — a personal agent that lives on a Fly.io Sprite.
+// Watches HackenProof for NEW bug bounty programs AND for CHANGES to
+// programs it already knows: a raised max reward, a lowered reputation
+// gate, smart contracts added to scope, or a program that starts paying
+// out. It scores each signal against the hunter's profile and files the
+// good ones as GitHub issues. Runs on a Sprite. Uses the GitHub connector
+// through the Sprites API Gateway (no token ever lives on the Sprite).
 //
 // Scoring is deterministic and rule-based, so the demo is reproducible:
 //   - max Critical reward (bigger payout = higher score)
@@ -10,11 +12,14 @@
 //   - smart-contract scope (the hunter's strength)
 //   - web / API scope
 //   - program maturity (rewards already paid out = real program)
-// New programs get a bonus. Score >= 60 gets filed as an issue.
+//   - freshness (published in the last 30 days = new opportunity)
+// New programs score 60+ to be filed. Changes file when they are
+// significant: reward raised by $500+, rep gate now passable, or smart
+// contracts added to scope.
 //
-// Optional LLM upgrade: if an OpenRouter connection is available, set
-// OPENROUTER_CONN_ID and the agent asks it to write the triage summary.
-// Without it, a template summary is used instead.
+// Optional LLM upgrade: if an OpenRouter connection with credits is
+// available, set OPENROUTER_CONN_ID and the agent asks it to write the
+// triage summary. Without it, a template summary is used instead.
 
 const fs = require("fs");
 const path = require("path");
@@ -39,7 +44,7 @@ const STATUS_FILE = path.join(DATA_DIR, "status.json");
 
 const UA = {
   "User-Agent":
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 BountyScout/1.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 BountyScout/2.0",
 };
 
 // ---------------------------------------------------------------- state
@@ -55,14 +60,17 @@ function saveJson(file, obj) {
   fs.writeFileSync(file, JSON.stringify(obj, null, 2));
 }
 
-let seen = loadJson(SEEN_FILE, {}); // slug -> { firstSeen, score, filed, name }
+// seen[slug] = { firstSeen, name, score, filed, snapshot: {...}, lastChangeAt }
+let seen = loadJson(SEEN_FILE, {});
 let status = loadJson(STATUS_FILE, {
   startedAt: new Date().toISOString(),
   lastRunAt: null,
   runs: 0,
   programsSeen: 0,
   issuesFiled: 0,
+  changesFiled: 0,
   lastFindings: [],
+  lastChanges: [],
   errors: [],
 });
 
@@ -104,7 +112,7 @@ function parseProgramPage(html, slug) {
   const p = { slug, url: `${HACKENPROOF}/programs/${slug}` };
 
   // Name: from the <title> tag ("ZMO Exchange: Program Info | HackenProof")
-  // or the <h1> ("ZMO Exchange: Program info"). Fall back to the slug.
+  // or the <h1>. Fall back to the slug.
   let name = slug;
   const titleM = html.match(/<title>([^<]*)<\/title>/i);
   if (titleM) name = titleM[1].replace(/:\s*Program Info\s*\|\s*HackenProof/i, "").trim();
@@ -121,12 +129,18 @@ function parseProgramPage(html, slug) {
   p.rewardMin = rangeM ? parseInt(rangeM[1].replace(/,/g, "")) : 0;
   p.rewardMax = rangeM ? parseInt(rangeM[2].replace(/,/g, "")) : 0;
 
+  // Severity: a range ("Critical $10,000 - $500,000") or a single value
+  // ("Medium $1,000", "Low $0").
   const sev = {};
   for (const s of ["Critical", "High", "Medium", "Low"]) {
     const m = text.match(
-      new RegExp(`${s} \\$([\\d,]+) - \\$([\\d,]+)`)
+      new RegExp(`${s} \\$([\\d,]+)(?: - \\$([\\d,]+))?`)
     );
-    if (m) sev[s] = [parseInt(m[1].replace(/,/g, "")), parseInt(m[2].replace(/,/g, ""))];
+    if (m) {
+      const lo = parseInt(m[1].replace(/,/g, ""));
+      const hi = m[2] ? parseInt(m[2].replace(/,/g, "")) : lo;
+      sev[s] = [lo, hi];
+    }
   }
   p.severity = sev;
 
@@ -135,6 +149,7 @@ function parseProgramPage(html, slug) {
 
   const pubM = text.match(/Published date (\d+ [A-Za-z]+ \d{4})/);
   p.published = pubM ? pubM[1] : "unknown";
+  p.publishedAt = pubM ? Date.parse(pubM[1]) : null;
 
   const paidM = text.match(/Total rewards: \$([\d,]+)/);
   p.totalPaid = paidM ? parseInt(paidM[1].replace(/,/g, "")) : 0;
@@ -142,8 +157,7 @@ function parseProgramPage(html, slug) {
   const subM = text.match(/Submissions: (\d+)/);
   p.submissions = subM ? parseInt(subM[1]) : 0;
 
-  const pocM = text.match(/PoC Required/);
-  p.pocRequired = !!pocM;
+  p.pocRequired = /PoC Required/.test(text);
 
   // scope: look for target types in the in-scope section
   const scopeIdx = text.indexOf("In scope");
@@ -157,6 +171,21 @@ function parseProgramPage(html, slug) {
   p.projectTypes = typeM ? typeM[1].trim() : "";
 
   return p;
+}
+
+function snapshotOf(p) {
+  return {
+    rewardMax: p.rewardMax,
+    rewardMin: p.rewardMin,
+    repRequired: p.repRequired,
+    hasSmartContracts: p.hasSmartContracts,
+    hasWeb: p.hasWeb,
+    hasApi: p.hasApi,
+    hasMobile: p.hasMobile,
+    totalPaid: p.totalPaid,
+    submissions: p.submissions,
+    published: p.published,
+  };
 }
 
 // ---------------------------------------------------------------- scoring
@@ -185,7 +214,45 @@ function scoreProgram(p) {
 
   if (p.pocRequired) { score -= 5; why.push("PoC required (-5)"); }
 
+  // freshness: published in the last 30 days is a fresh opportunity
+  if (p.publishedAt && Date.now() - p.publishedAt < 30 * 24 * 60 * 60 * 1000) {
+    score += 10;
+    why.push(`published ${p.published}, fresh (+10)`);
+  }
+
   return { score: Math.max(0, Math.min(100, score)), why };
+}
+
+// Detect a meaningful change between the stored snapshot and the fresh page.
+// Returns null (no change worth filing) or { summary, important }.
+function detectChange(oldSnap, p) {
+  if (!oldSnap) return null; // first sighting, baseline only
+  const changes = [];
+  let important = false;
+
+  if (p.rewardMax > oldSnap.rewardMax) {
+    const diff = p.rewardMax - oldSnap.rewardMax;
+    changes.push(`max reward rose ${money(oldSnap.rewardMax)} -> ${money(p.rewardMax)} (+${money(diff)})`);
+    if (diff >= 500) important = true;
+  }
+  if (p.repRequired < oldSnap.repRequired) {
+    changes.push(`reputation gate dropped ${oldSnap.repRequired} -> ${p.repRequired || "none"}`);
+    if (oldSnap.repRequired > HUNTER_REP && p.repRequired <= HUNTER_REP) {
+      changes.push("gate now passable with your 80 rep");
+      important = true;
+    }
+  }
+  if (!oldSnap.hasSmartContracts && p.hasSmartContracts) {
+    changes.push("smart contracts added to scope");
+    important = true;
+  }
+  if (!oldSnap.hasWeb && p.hasWeb) changes.push("web added to scope");
+  if (!oldSnap.hasApi && p.hasApi) changes.push("API added to scope");
+  if (p.totalPaid > oldSnap.totalPaid) {
+    changes.push(`total paid rose ${money(oldSnap.totalPaid)} -> ${money(p.totalPaid)}`);
+  }
+  if (changes.length === 0) return null;
+  return { summary: changes.join("; "), important };
 }
 
 // ---------------------------------------------------------------- LLM (optional)
@@ -232,21 +299,29 @@ async function ghApi(path, method, body) {
   return JSON.parse(text);
 }
 
-function issueBody(p, s) {
-  const sevLines = Object.entries(p.severity || {})
-    .map(([k, v]) => `- ${k}: ${money(v[0])} - ${money(v[1])}`)
+function sevLines(p) {
+  return Object.entries(p.severity || {})
+    .map(([k, v]) => (v[0] === v[1] ? `- ${k}: ${money(v[0])}` : `- ${k}: ${money(v[0])} - ${money(v[1])}`))
     .join("\n");
-  const scope = [];
-  if (p.hasSmartContracts) scope.push("smart contracts");
-  if (p.hasWeb) scope.push("web");
-  if (p.hasApi) scope.push("API");
-  if (p.hasMobile) scope.push("mobile");
-  const gate = p.repRequired === 0
-    ? "No reputation gate. You can join now."
-    : p.repRequired <= HUNTER_REP
-    ? `Reputation gate ${p.repRequired}. You have ${HUNTER_REP}, so you can join now.`
-    : `Reputation gate ${p.repRequired}. You have ${HUNTER_REP}, so you need ${p.repRequired - HUNTER_REP} more reputation first.`;
-  const verdict = s.score >= SCORE_THRESHOLD ? "Worth a look." : "Below the filing threshold.";
+}
+
+function scopeList(p) {
+  const s = [];
+  if (p.hasSmartContracts) s.push("smart contracts");
+  if (p.hasWeb) s.push("web");
+  if (p.hasApi) s.push("API");
+  if (p.hasMobile) s.push("mobile");
+  return s.join(", ") || "see program page";
+}
+
+function repLine(p) {
+  if (p.repRequired === 0) return "No reputation gate. You can join now.";
+  if (p.repRequired <= HUNTER_REP)
+    return `Reputation gate ${p.repRequired}. You have ${HUNTER_REP}, so you can join now.`;
+  return `Reputation gate ${p.repRequired}. You have ${HUNTER_REP}, so you need ${p.repRequired - HUNTER_REP} more reputation first.`;
+}
+
+function issueBodyNew(p, s) {
   return [
     `**${p.name}** — new program on HackenProof.`,
     ``,
@@ -255,32 +330,67 @@ function issueBody(p, s) {
     `Reward range: ${money(p.rewardMin)} - ${money(p.rewardMax)}`,
     ``,
     `Rewards by severity:`,
-    sevLines || "- not listed",
+    sevLines(p) || "- not listed",
     ``,
-    `Scope: ${scope.join(", ") || "see program page"}`,
+    `Scope: ${scopeList(p)}`,
     `PoC required: ${p.pocRequired ? "yes" : "no"}`,
     `Submissions so far: ${p.submissions} | Total paid: ${money(p.totalPaid)}`,
     ``,
-    `**Reputation:** ${gate}`,
+    `**Reputation:** ${repLine(p)}`,
     ``,
-    `**Score: ${s.score}/100** — ${verdict}`,
+    `**Score: ${s.score}/100** — ${s.score >= SCORE_THRESHOLD ? "Worth a look." : "Below the filing threshold."}`,
     `Score breakdown: ${s.why.join("; ")}.`,
     ``,
     `Filed by Bounty Scout (runs on a Fly.io Sprite).`,
   ].join("\n");
 }
 
-async function fileIssue(p, s) {
-  const summary = await llmSummary(p, s);
-  let body = issueBody(p, s);
-  if (summary) body = body.replace(
+function issueBodyChange(p, s, change) {
+  return [
+    `**${p.name}** — this program changed on HackenProof.`,
+    ``,
+    `Program: ${p.url}`,
+    ``,
+    `**What changed:** ${change.summary}`,
+    ``,
+    `Reward range now: ${money(p.rewardMin)} - ${money(p.rewardMax)}`,
+    ``,
+    `Rewards by severity:`,
+    sevLines(p) || "- not listed",
+    ``,
+    `Scope: ${scopeList(p)}`,
+    `PoC required: ${p.pocRequired ? "yes" : "no"}`,
+    `Submissions so far: ${p.submissions} | Total paid: ${money(p.totalPaid)}`,
+    ``,
+    `**Reputation:** ${repLine(p)}`,
+    ``,
     `**Score: ${s.score}/100**`,
-    `**Scout's take:** ${summary}\n\n**Score: ${s.score}/100**`
-  );
+    `Score breakdown: ${s.why.join("; ")}.`,
+    ``,
+    `Filed by Bounty Scout (runs on a Fly.io Sprite).`,
+  ].join("\n");
+}
+
+async function fileIssue(p, s, kind, change) {
+  const summary = await llmSummary(p, s);
+  let body, title;
+  if (kind === "change") {
+    body = issueBodyChange(p, s, change);
+    title = `[Change] ${p.name} — ${change.summary.split(";")[0]} (score ${s.score}/100)`;
+  } else {
+    body = issueBodyNew(p, s);
+    title = `[New] ${p.name} — up to ${money(p.rewardMax)} (score ${s.score}/100)`;
+  }
+  if (summary) {
+    body = body.replace(
+      `**Score: ${s.score}/100**`,
+      `**Scout's take:** ${summary}\n\n**Score: ${s.score}/100**`
+    );
+  }
   const issue = await ghApi(`/repos/${REPO_OWNER}/${REPO_NAME}/issues`, "POST", {
-    title: `[New] ${p.name} — up to ${money(p.rewardMax)} (score ${s.score}/100)`,
+    title,
     body,
-    labels: ["new-program"],
+    labels: kind === "change" ? ["change"] : ["new-program"],
   });
   return issue;
 }
@@ -290,49 +400,58 @@ async function runCheck() {
   const runAt = new Date().toISOString();
   log("--- check started ---");
   const findings = [];
+  const changes = [];
   try {
     const slugs = await listPrograms();
     log(`programs listed: ${slugs.length}`);
-    const fresh = slugs.filter((s) => !seen[s]);
-    log(`new programs: ${fresh.length}`);
 
-    const scored = [];
-    for (const slug of fresh) {
+    let filed = 0;
+    for (const slug of slugs) {
       try {
         await sleep(800); // be polite to hackenproof.com
         const html = await fetchText(`${HACKENPROOF}/programs/${slug}`);
         const p = parseProgramPage(html, slug);
         const s = scoreProgram(p);
-        scored.push({ p, s });
-        seen[slug] = { firstSeen: runAt, score: s.score, filed: false, name: p.name };
-        log(`new: ${p.name} — max ${money(p.rewardMax)}, rep ${p.repRequired || "none"}, score ${s.score}`);
-      } catch (e) {
-        log(`failed to parse ${slug}:`, e.message);
-        status.errors.push(`${runAt} ${slug}: ${e.message}`);
-      }
-    }
+        const prev = seen[slug];
 
-    scored.sort((a, b) => b.s.score - a.s.score);
-    let filed = 0;
-    for (const { p, s } of scored) {
-      if (filed >= MAX_ISSUES_PER_RUN) break;
-      if (s.score < SCORE_THRESHOLD) continue;
-      try {
-        const issue = await fileIssue(p, s);
-        seen[p.slug].filed = true;
-        filed++;
-        log(`filed issue #${issue.number}: ${p.name} (${issue.html_url})`);
-        findings.push({
-          name: p.name,
-          slug: p.slug,
-          score: s.score,
-          maxReward: p.rewardMax,
-          repRequired: p.repRequired,
-          issue: issue.html_url,
-        });
+        if (!prev) {
+          // brand new program
+          seen[slug] = { firstSeen: runAt, name: p.name, score: s.score, filed: false, snapshot: snapshotOf(p) };
+          log(`new: ${p.name} — max ${money(p.rewardMax)}, rep ${p.repRequired || "none"}, score ${s.score}`);
+          if (s.score >= SCORE_THRESHOLD && filed < MAX_ISSUES_PER_RUN) {
+            const issue = await fileIssue(p, s, "new");
+            seen[slug].filed = true;
+            filed++;
+            log(`filed issue #${issue.number}: ${p.name} (${issue.html_url})`);
+            findings.push({
+              kind: "new", name: p.name, slug: p.slug, score: s.score,
+              maxReward: p.rewardMax, repRequired: p.repRequired, issue: issue.html_url,
+            });
+          }
+        } else {
+          // known program: check for changes
+          const change = detectChange(prev.snapshot, p);
+          prev.snapshot = snapshotOf(p);
+          prev.score = s.score;
+          prev.name = p.name;
+          if (change) {
+            log(`change: ${p.name} — ${change.summary} (important: ${change.important})`);
+            changes.push({ name: p.name, slug: p.slug, summary: change.summary, score: s.score, maxReward: p.rewardMax, repRequired: p.repRequired });
+            if (change.important && filed < MAX_ISSUES_PER_RUN) {
+              const issue = await fileIssue(p, s, "change", change);
+              filed++;
+              log(`filed change issue #${issue.number}: ${p.name} (${issue.html_url})`);
+              findings.push({
+                kind: "change", name: p.name, slug: p.slug, score: s.score,
+                maxReward: p.rewardMax, repRequired: p.repRequired, issue: issue.html_url,
+                change: change.summary,
+              });
+            }
+          }
+        }
       } catch (e) {
-        log(`failed to file ${p.slug}:`, e.message);
-        status.errors.push(`${runAt} file ${p.slug}: ${e.message}`);
+        log(`failed ${slug}:`, e.message);
+        status.errors.push(`${runAt} ${slug}: ${e.message}`);
       }
     }
 
@@ -340,11 +459,13 @@ async function runCheck() {
     status.runs++;
     status.programsSeen = Object.keys(seen).length;
     status.issuesFiled += filed;
-    // keep the latest filed issues across runs (newest first, max 5)
+    status.changesFiled = (status.changesFiled || 0) + findings.filter((f) => f.kind === "change").length;
+    // keep the latest findings and changes across runs (newest first, max 5 each)
     status.lastFindings = [...findings, ...(status.lastFindings || [])].slice(0, 5);
+    status.lastChanges = [...changes, ...(status.lastChanges || [])].slice(0, 5);
     saveJson(SEEN_FILE, seen);
     saveJson(STATUS_FILE, status);
-    log(`--- check done: ${fresh.length} new, ${filed} issues filed ---`);
+    log(`--- check done: ${findings.length} filed, ${changes.length} changes seen ---`);
   } catch (e) {
     log("check failed:", e.message);
     status.errors.push(`${runAt}: ${e.message}`);
@@ -354,31 +475,36 @@ async function runCheck() {
 
 // ---------------------------------------------------------------- status page
 function statusHtml() {
-  const rows = (status.lastFindings || [])
+  const esc = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  const findingRows = (status.lastFindings || [])
     .map(
       (f) =>
-        `<li><a href="${f.issue}">${f.name}</a> — score ${f.score}/100, up to ${money(f.maxReward)}, rep gate ${f.repRequired || "none"}</li>`
+        `<li><a href="${f.issue}">${esc(f.name)}</a> — ${f.kind === "change" ? "changed" : "new"}, score ${f.score}/100, up to ${money(f.maxReward)}, rep gate ${f.repRequired || "none"}</li>`
     )
     .join("\n") || "<li>No issues filed yet.</li>";
-  const seenRows = Object.entries(seen)
+  const changeRows = (status.lastChanges || [])
+    .map((c) => `<li>${esc(c.name)} — ${esc(c.summary)}</li>`)
+    .join("\n") || "<li>No changes detected yet.</li>";
+  const allRows = Object.entries(seen)
     .sort((a, b) => b[1].score - a[1].score)
-    .slice(0, 10)
     .map(
-      ([slug, v]) =>
-        `<li>${v.name} — score ${v.score}/100 ${v.filed ? "(issue filed)" : ""}</li>`
+      ([, v]) =>
+        `<tr><td>${esc(v.name)}</td><td>${v.score}/100</td><td>${v.snapshot ? money(v.snapshot.rewardMax) : "-"}</td><td>${v.snapshot && v.snapshot.repRequired ? v.snapshot.repRequired : "none"}</td><td>${v.filed ? "issue filed" : "-"}</td></tr>`
     )
     .join("\n");
   return `<!doctype html><html><head><meta charset="utf-8"><title>Bounty Scout</title>
-<style>body{font-family:system-ui,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.5}h1{font-size:28px}code{background:#f0f0f0;padding:2px 6px;border-radius:4px}</style>
+<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 16px;line-height:1.5}h1{font-size:28px}table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left;font-size:14px}</style>
 </head><body>
 <h1>Bounty Scout</h1>
-<p>A personal agent living on a Fly.io Sprite. It watches HackenProof for new bug bounty programs, scores them against the hunter (80 rep, smart-contract skills), and files the good ones as GitHub issues in <a href="https://github.com/onlyjepe/bounty-scout">onlyjepe/bounty-scout</a>.</p>
-<p><strong>Status:</strong> running — last check ${status.lastRunAt || "never"} · ${status.runs} checks · ${status.programsSeen} programs seen · ${status.issuesFiled} issues filed</p>
+<p>A personal agent living on a Fly.io Sprite. It watches HackenProof for new bug bounty programs and for changes to the ones it knows, scores each signal against the hunter (80 rep, smart-contract skills), and files the good ones as GitHub issues in <a href="https://github.com/onlyjepe/bounty-scout">onlyjepe/bounty-scout</a>.</p>
+<p><strong>Status:</strong> running — last check ${status.lastRunAt || "never"} · ${status.runs} checks · ${status.programsSeen} programs watched · ${status.issuesFiled} issues filed (${status.changesFiled || 0} from changes)</p>
 <h2>Latest findings</h2>
-<ul>${rows}</ul>
-<h2>Top programs seen</h2>
-<ul>${seenRows}</ul>
-<p><small>Checks run hourly. Scoring is rule-based: max reward, reputation gate, smart-contract scope, and payout history.</small></p>
+<ul>${findingRows}</ul>
+<h2>Recent changes</h2>
+<ul>${changeRows}</ul>
+<h2>All programs watched</h2>
+<table><tr><th>Program</th><th>Score</th><th>Max reward</th><th>Rep gate</th><th>Filed</th></tr>${allRows}</table>
+<p><small>Checks run hourly. Scoring is rule-based: max reward, reputation gate, smart-contract scope, payout history, and freshness. A change is filed when a reward rises by $500+, a reputation gate becomes passable, or smart contracts are added to scope.</small></p>
 </body></html>`;
 }
 
