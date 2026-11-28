@@ -30,6 +30,11 @@ Built for **Hacksgiving 2026** (Fly.io, Nov 23–29).
    `[Change]` issue if it matters: max reward up $500+, reputation gate
    now passable with 80 rep, or smart contracts added to scope. Smaller
    changes (payout growth, web/API added) are logged on the status page.
+6. **Sleep-proof checks (v3)** — the Sprite sleeps when idle and freezes
+   Node timers, so a plain 1h interval stalled for hours. The loop is now
+   a 5-minute watchdog that runs a check whenever the wall-clock gap
+   since the last check is 1h or more, plus a catch-up trigger on every
+   status-page request. A check can never silently go stale again.
 
 ## Connectors
 
