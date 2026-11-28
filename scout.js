@@ -1,10 +1,15 @@
-// Bounty Scout v2 — a personal agent that lives on a Fly.io Sprite.
+// Bounty Scout v3 — a personal agent that lives on a Fly.io Sprite.
 // Watches HackenProof for NEW bug bounty programs AND for CHANGES to
 // programs it already knows: a raised max reward, a lowered reputation
 // gate, smart contracts added to scope, or a program that starts paying
 // out. It scores each signal against the hunter's profile and files the
 // good ones as GitHub issues. Runs on a Sprite. Uses the GitHub connector
 // through the Sprites API Gateway (no token ever lives on the Sprite).
+//
+// v3 fix: the Sprite sleeps when idle and freezes Node timers, so the old
+// 1h setInterval stalled for hours. The loop is now a 5-minute watchdog
+// that runs a check whenever the wall-clock gap since the last check is
+// >= 1h, plus a catch-up trigger on every status-page request.
 //
 // Scoring is deterministic and rule-based, so the demo is reproducible:
 //   - max Critical reward (bigger payout = higher score)
@@ -34,6 +39,10 @@ const HACKENPROOF = "https://hackenproof.com";
 const HUNTER_REP = 80; // takanome on HackenProof
 const SCORE_THRESHOLD = 60;
 const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+const WATCHDOG_MS = 5 * 60 * 1000; // 5 minutes: the Sprite sleeps when idle
+// and freezes Node timers, so a 1h setInterval alone can stall for hours.
+// The watchdog wakes every 5 min and runs a check whenever the wall-clock
+// time since the last check is >= 1h, so it catches up after sleep.
 const MAX_ISSUES_PER_RUN = 5;
 const PORT = 8080;
 const OPENROUTER_CONN_ID = process.env.OPENROUTER_CONN_ID || ""; // optional
@@ -396,6 +405,25 @@ async function fileIssue(p, s, kind, change) {
 }
 
 // ---------------------------------------------------------------- main loop
+// Guard so two triggers (watchdog tick, HTTP request) never run a check twice.
+let checking = false;
+function lastRunMs() {
+  return status.lastRunAt ? Date.parse(status.lastRunAt) : 0;
+}
+// Run a check only when one is not already running and the last check is
+// stale (>= 1h ago, by wall-clock time, not by timer ticks).
+async function maybeRunCheck(reason) {
+  if (checking) return;
+  if (Date.now() - lastRunMs() < CHECK_INTERVAL_MS) return;
+  checking = true;
+  try {
+    log(`catch-up check (${reason}) — last check ${status.lastRunAt || "never"}`);
+    await runCheck();
+  } finally {
+    checking = false;
+  }
+}
+
 async function runCheck() {
   const runAt = new Date().toISOString();
   log("--- check started ---");
@@ -509,6 +537,10 @@ function statusHtml() {
 }
 
 const server = http.createServer((req, res) => {
+  // Any visit to the status page wakes the Sprite and is a chance to catch
+  // up a check that sleep delayed. Runs in the background; the response
+  // is not blocked on it.
+  maybeRunCheck("stale on status request").catch((e) => log("catch-up failed:", e.message));
   if (req.url === "/status.json") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ...status, seenCount: Object.keys(seen).length }, null, 2));
@@ -522,5 +554,7 @@ server.listen(PORT, () => log(`status page on :${PORT}`));
 // ---------------------------------------------------------------- start
 (async () => {
   await runCheck();
-  setInterval(runCheck, CHECK_INTERVAL_MS);
+  // Watchdog, not a plain 1h interval: ticks every 5 min and runs a check
+  // whenever the wall-clock gap since the last check is >= 1h.
+  setInterval(() => maybeRunCheck("watchdog tick"), WATCHDOG_MS);
 })();
